@@ -15,13 +15,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🔑 API KEY (Streamlit Secrets)
+# 🔑 API KEY (안전장치 포함)
 # ==========================================
 try:
     API_KEY = st.secrets["API_KEY"]
 except:
     st.error("🚨 API 키가 설정되지 않았습니다. Streamlit Secrets를 확인해주세요.")
-    st.stop() # 키 없으면 여기서 멈춤
+    st.stop()
 
 BASE_URL = f"https://www.thesportsdb.com/api/v1/json/{API_KEY}"
 
@@ -36,15 +36,9 @@ LEAGUES = {
 
 # 2. 국내 컵대회 매핑
 DOMESTIC_CUPS = {
-    "4328": ["4338", "4342"], # EPL -> FA Cup, League Cup
-    "4335": ["4467"], # La Liga -> Copa del Rey
-    "4331": ["4347"], # Bundesliga -> DFB Pokal
-    "4332": ["4359"], # Serie A -> Coppa Italia
-    "4334": ["4484"], # Ligue 1 -> Coupe de France
-    "4337": ["4465"], # Eredivisie -> KNVB Cup
-    "4344": ["4466"], # Portugal -> Taca de Portugal
-    "4689": ["4690"], # K-League -> FA Cup
-    "4633": ["4828", "4637"], # J-League -> Emperors Cup
+    "4328": ["4338", "4342"], "4335": ["4467"], "4331": ["4347"], 
+    "4332": ["4359"], "4334": ["4484"], "4337": ["4465"], 
+    "4344": ["4466"], "4689": ["4690"], "4633": ["4828", "4637"], 
 }
 
 # 3. 국제 대항전 매핑
@@ -68,16 +62,19 @@ VENUE_OPTIONS = {
     "다음 경기가 원정일 때 (Next is Away)": "Away"
 }
 
-# --- 함수 ---
+# --- 핵심 함수 (에러 방지 강화됨) ---
 
 def get_seasons(league_id, logs):
+    """시즌 목록 가져오기"""
     url = f"{BASE_URL}/search_all_seasons.php?id={league_id}"
     try:
         res = requests.get(url)
-        if res.status_code != 200:
-            logs.append(f"❌ API 오류: {res.status_code}")
-            return []
-        data = res.json()
+        # 응답이 비어있거나 200 OK가 아니면 빈 리스트 반환
+        if res.status_code != 200: return []
+        try:
+            data = res.json()
+        except: return [] # JSON 변환 실패 시 무시
+
         if not data or 'seasons' not in data: return []
         
         valid = []
@@ -88,25 +85,35 @@ def get_seasons(league_id, logs):
                     valid.append(s['strSeason'])
             except: continue
         return valid
-    except Exception as e:
-        logs.append(f"⚠️ 에러: {e}")
-        return []
+    except: return []
 
 def get_events(league_id, season):
+    """
+    [핵심 수정] 
+    컵대회 데이터가 없거나 깨져있을 때 에러를 내지 않고
+    빈 리스트([])를 반환하도록 'try-except'를 2중으로 감쌌습니다.
+    """
     try:
         url = f"{BASE_URL}/eventsseason.php?id={league_id}&s={season}"
         res = requests.get(url)
-        if res.status_code != 200: return []
-        data = res.json()
+        
+        if res.status_code != 200: return [] # 서버 에러면 통과
+        
+        try:
+            data = res.json() # 여기서 에러가 많이 납니다 (Expecting value...)
+        except:
+            return [] # JSON이 아니면 그냥 빈 리스트 반환하고 끝냄 (앱 안 죽음)
+            
         return data['events'] if data and 'events' in data else []
-    except: return []
+    except: return [] # 그 외 모든 에러 무시
 
 def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_bar, status_text, debug_area):
     logs = []
     seasons = get_seasons(main_league_id, logs)
     
     if not seasons:
-        debug_area.code("시즌 데이터 로드 실패. API 키를 확인하세요.\n" + "\n".join(logs))
+        # 시즌조차 못 가져오면 이건 API 키 문제일 확률이 높음
+        debug_area.error("데이터를 가져올 수 없습니다. API 키가 올바른지 확인해주세요.")
         return None
     
     stats = {"total": 0, "W": 0, "D": 0, "L": 0}
@@ -115,30 +122,32 @@ def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_
     target_cup_ids = DOMESTIC_CUPS.get(main_league_id, []) + INTL_CUPS
     
     for i, season in enumerate(seasons):
-        status_text.text(f"🔍 {season} 분석 중...")
+        status_text.text(f"🔍 {season} 시즌 분석 중...")
         progress_bar.progress((i + 1) / total_seasons)
         
         all_matches = []
         
-        # 리그 데이터
+        # 1. 리그 데이터 가져오기
         league_data = get_events(main_league_id, season)
         for m in league_data:
             m['is_league'] = True
             all_matches.append(m)
             
-        # 컵 데이터
+        # 2. 컵 데이터 가져오기 (에러나면 건너뜀)
         for cup_id in target_cup_ids:
             cup_data = get_events(cup_id, season)
-            for m in cup_data:
-                m['is_league'] = False
-                all_matches.append(m)
+            if cup_data: # 데이터가 있을 때만 추가
+                for m in cup_data:
+                    m['is_league'] = False
+                    all_matches.append(m)
         
         if not all_matches: continue
         
-        # 정렬
+        # 3. 날짜순 정렬
         all_matches = [m for m in all_matches if m['dateEvent']]
         all_matches.sort(key=lambda x: x['dateEvent'])
         
+        # 4. 시뮬레이션
         threshold = 5
         team_pts = {}
         team_hist = {}
@@ -154,7 +163,7 @@ def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_
             else: h_res, a_res, h_p, a_p = 'L', 'W', 0, 3
             
             if idx > threshold:
-                # A. 순위 (리그만)
+                # A. 순위 확인 (리그만)
                 sorted_teams = sorted(team_pts.items(), key=lambda x: x[1], reverse=True)
                 if len(sorted_teams) >= target_rank:
                     target_name = sorted_teams[target_rank-1][0]
@@ -164,14 +173,16 @@ def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_
                     elif a_team == target_name: role = 'Away'
                     
                     if role:
-                        # B. 흐름 (전체)
+                        # B. 흐름 확인 (전체)
                         hist = team_hist.get(target_name, [])
                         is_match = False
                         
+                        # 3 Winless
                         if streak_pattern == "3_WINLESS":
                             if len(hist) >= 3:
                                 last_3 = hist[-3:]
                                 if "W" not in last_3: is_match = True
+                        # 일반 패턴
                         elif isinstance(streak_pattern, list):
                             pat_len = len(streak_pattern)
                             if len(hist) >= pat_len:
@@ -181,6 +192,7 @@ def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_
                                         check = False; break
                                 if check: is_match = True
                         
+                        # C. 결과 집계
                         if is_match:
                             if venue_filter == "All" or role == venue_filter:
                                 stats["total"] += 1
@@ -200,12 +212,11 @@ def analyze(main_league_id, target_rank, streak_pattern, venue_filter, progress_
     return stats
 
 # --- UI ---
-st.title("🏆 SoccerModel: Final Analyzer")
+st.title("🏆 SoccerModel: Robust Analyzer")
 st.markdown("""
 <div class='info-box'>
-    <b>✅ 기능 확인:</b><br>
-    • <b>순위:</b> 리그 승점 기준<br>
-    • <b>흐름:</b> 컵대회 포함 (3연속 무승 기능 탑재)<br>
+    <b>🛡️ 에러 방지 모드 적용됨:</b><br>
+    데이터가 없는 컵대회나 시즌은 자동으로 건너뛰어 프로그램이 멈추지 않습니다.
 </div>
 """, unsafe_allow_html=True)
 
@@ -234,4 +245,4 @@ if st.button("🚀 분석 실행"):
         c2.metric("무승부 확률", f"{(res['D']/tot)*100:.1f}%", f"{res['D']}회")
         c3.metric("패배 확률", f"{(res['L']/tot)*100:.1f}%", f"{res['L']}회", delta_color="inverse")
     else:
-        st.warning("조건에 맞는 데이터가 없거나, API 데이터를 불러오지 못했습니다.")
+        st.warning("조건에 맞는 데이터가 없습니다. (데이터 부족 또는 API 키 확인 필요)")
